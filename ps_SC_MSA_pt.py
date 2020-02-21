@@ -7,6 +7,19 @@ import os
 import utils_pt
 
 
+def clip_gradient(optimizer, grad_clip):   # 对应源码中优化器中的tf.clip_by_value()
+    """
+    Clips gradients computed during backpropagation to avoid explosion of gradients.
+
+    :param optimizer: optimizer with the gradients to be clipped
+    :param grad_clip: clip value
+    """
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            if param.grad is not None:
+                param.grad.data.clamp_(-grad_clip, grad_clip)
+
+
 if __name__ == '__main__':
 
     # ################ Prepare Data ###################
@@ -49,19 +62,24 @@ if __name__ == '__main__':
 
     # ################ Model and Run ###################
     print_writer_filename = logdir_name + '/print_files/print.txt'  # saver for printing
-
     word_embedding = torch.from_numpy(word_embedding_np).float()   # numpy to tensor
     sememe_embedding = torch.from_numpy(sememe_embedding_np).float()
     print(word_embedding.dtype)
     print(sememe_embedding.dtype)
 
-    class ps_SCMSA(torch.nn.Module):
+    class SCMSA(torch.nn.Module):
         def __init__(self, dim):
-            super(ps_SCMSA, self).__init__()
+            super(SCMSA, self).__init__()
             self.linear1 = torch.nn.Linear(dim, dim)   # W_a, b_a
             self.linear2 = torch.nn.Linear(2 * dim, dim)   # W_c, b_c
+            # 参数初始化
+            self.linear1.weight.data = torch.normal(0, 0.5, size=self.linear1.weight.data.size())
+            self.linear1.bias.data = torch.zeros(size=self.linear1.bias.data.size())
+            self.linear2.weight.data = torch.normal(0, 1.0, size=self.linear2.weight.data.size())
+            self.linear2.bias.data = torch.zeros(size=self.linear2.bias.data.size())
 
         def forward(self, input_word_l, input_word_r, input_sememe_l, input_sememe_r):
+            # attention
             embed_sememe_l = F.softmax(torch.matmul(input_sememe_l, torch.tanh(self.linear1(input_word_r)).t()), dim=0) * input_sememe_l
             embed_aggre_word_l_pure = torch.sum(embed_sememe_l, dim=0, keepdim=True)
             embed_sememe_r = F.softmax(torch.matmul(input_sememe_r, torch.tanh(self.linear1(input_word_l)).t()), dim=0) * input_sememe_r
@@ -71,17 +89,11 @@ if __name__ == '__main__':
             output = torch.tanh(self.linear2(torch.cat((embed_word_whole, embed_sememe_whole), 1)))
             return output
 
-    model = ps_SCMSA(dim)
+    model = SCMSA(dim)
 
     criterion = torch.nn.MSELoss(reduction='mean')
     optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)   # 简单的设置
-
-    # regularizer
-    '''
-    权重的正则化，这部分目前先不考虑
-    tf.add_to_collection('losses', tf.contrib.layers.l2_regularizer(labda)(W_a))
-    tf.add_to_collection('losses', tf.contrib.layers.l2_regularizer(labda)(W_c))
-    '''
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=lr_decay_rate)   # 学习率衰减
 
     # training
     print('train')
@@ -92,6 +104,7 @@ if __name__ == '__main__':
         for current_num, train_tup in enumerate(hownet.comp_train):
             total_num = epoch * train_num + current_num
             batch_dict = utils_pt.generate_one_example(hownet, train_tup)
+
             optimizer.zero_grad()
 
             embed_word_l = word_embedding[batch_dict['wl']].view(1, -1)   # 截取行的数据
@@ -101,7 +114,8 @@ if __name__ == '__main__':
             embed_sememe_r = utils_pt.norm(sememe_embedding[batch_dict['sr']])
 
             phrase_vec = model(embed_word_l, embed_word_r, embed_sememe_l, embed_sememe_r)
-            loss = criterion(phrase_vec, embed_truth)
+
+            loss = criterion(phrase_vec, embed_truth) + labda * (torch.norm(model.linear1.weight, 2) + torch.norm(model.linear2.weight, 2))
 
             loss_this_epoch += loss
 
@@ -110,7 +124,10 @@ if __name__ == '__main__':
                 sys.stdout.write('\rTraining num: ' + str(current_num) + ' of ' + str(train_num) + ' loss:' + str(loss_this_epoch / (0.1 + current_num)))
 
             loss.backward()
+            clip_gradient(optimizer, 5.0)
             optimizer.step()
+
+        scheduler.step()
 
         with open(print_writer_filename, 'a', encoding='utf-8') as fprint:
             fprint.write('epoch: '+str(epoch+1)+' loss:'+str(loss_this_epoch/(0.1+len(hownet.comp_train)))+'\n')
@@ -120,7 +137,6 @@ if __name__ == '__main__':
     loss_dev = 0
     for current_num, dev_tup in enumerate(hownet.comp_dev):
         batch_dict = utils_pt.generate_one_example(hownet, dev_tup)
-        optimizer.zero_grad()
 
         embed_word_l = word_embedding[batch_dict['wl']].view(1, -1)   # 截取行的数据
         embed_word_r = word_embedding[batch_dict['wr']].view(1, -1)
@@ -129,12 +145,10 @@ if __name__ == '__main__':
         embed_sememe_r = utils_pt.norm(sememe_embedding[batch_dict['sr']])
 
         phrase_vec = model(embed_word_l, embed_word_r, embed_sememe_l, embed_sememe_r)
-        loss = criterion(phrase_vec, embed_truth)
+
+        loss = criterion(phrase_vec, embed_truth) + labda * (torch.norm(model.linear1.weight, 2) + torch.norm(model.linear2.weight, 2))
 
         loss_dev += loss
-
-        loss.backward()
-        optimizer.step()
 
     sys.stdout.flush()
     sys.stdout.write('\nDev set loss:' + str(loss_dev / (0.1 + len(hownet.comp_dev))) + '\n')
@@ -156,6 +170,7 @@ if __name__ == '__main__':
             embed_sememe_r = utils_pt.norm(sememe_embedding[batch_test['sr']])
 
             phrase_vector = model(embed_word_l, embed_word_r, embed_sememe_l, embed_sememe_r)
+
             with open(phrase_vec_file, 'a', encoding='utf-8') as f_phrase_embed:
                 f_phrase_embed.write(test_tup[4] + ' ')
                 phrase_vector = phrase_vector.tolist()[0]
@@ -166,5 +181,3 @@ if __name__ == '__main__':
     print('Have written {} words to phrase_vector.txt'.format(number))
     with open(print_writer_filename, 'a', encoding='utf-8') as fprint:
         fprint.write('Have written {} words to phrase_vector.txt'.format(number))
-
-
