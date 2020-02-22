@@ -13,6 +13,19 @@ def CrossEntropyLoss(inputs, targets, weight):
     return torch.mean(res)
 
 
+def clip_gradient(optimizer, grad_clip):   # 对应源码中优化器中的tf.clip_by_value()
+    """
+    Clips gradients computed during backpropagation to avoid explosion of gradients.
+
+    :param optimizer: optimizer with the gradients to be clipped
+    :param grad_clip: clip value
+    """
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            if param.grad is not None:
+                param.grad.data.clamp_(-grad_clip, grad_clip)
+
+
 if __name__ == '__main__':
 
     # ################ Prepare Data ###################
@@ -62,18 +75,40 @@ if __name__ == '__main__':
     print(word_embedding.dtype)
     print(sememe_embedding.dtype)
 
-    W_a = torch.normal(0, 0.5, (dim, dim), requires_grad=True).float()
-    b_a = torch.zeros(1, dim, requires_grad=True).float()
-    w_k_init_eye = torch.reshape(torch.eye(dim), (1, dim, dim)).repeat(4, 2, 1).float()
-    w_k_init_gaussian = torch.reshape(torch.normal(0, 0.1, (8 * dim, dim)), (4, 2 * dim, dim)).float()
-    b_c = torch.zeros(1, dim, requires_grad=True).float()
-    w_k_init_eye.requires_grad = True
-    w_k_init_gaussian.requires_grad = True
+    class SEMSCMSAR(torch.nn.Module):
+        def __init__(self, dim):
+            super(SEMSCMSAR, self).__init__()
+            self.linear1 = torch.nn.Linear(dim, dim)   # W_a, b_a
+            # 参数初始化
+            self.linear1.weight.data = torch.normal(0, 0.5, size=self.linear1.weight.data.size())
+            self.linear1.bias.data = torch.zeros(size=self.linear1.bias.data.size())
+            # 自定义weight and bias
+            w_k_init_eye = torch.reshape(torch.eye(dim), (1, dim, dim)).repeat(4, 2, 1)
+            w_k_init_gaussian = torch.reshape(torch.normal(0, 0.1, (8 * dim, dim)), (4, 2 * dim, dim))
+            w_c = w_k_init_eye + w_k_init_gaussian
+            w_c.requires_grad = True
+            b_c = torch.zeros(1, dim, requires_grad=True)
+            self.weight = torch.nn.Parameter(w_c)
+            self.bias = torch.nn.Parameter(b_c)
+
+        def forward(self, pos, dim, input_word_l, input_word_r, input_sememe_l, input_sememe_r):
+            # attention
+            embed_sememe_l = F.softmax(torch.matmul(input_sememe_l, torch.tanh(self.linear1(input_word_r)).t()), dim=0) * input_sememe_l
+            embed_aggre_word_l_pure = torch.sum(embed_sememe_l, dim=0, keepdim=True)
+            embed_sememe_r = F.softmax(torch.matmul(input_sememe_r, torch.tanh(self.linear1(input_word_l)).t()), dim=0) * input_sememe_r
+            embed_aggre_word_r_pure = torch.sum(embed_sememe_r, dim=0, keepdim=True)
+            embed_word_whole = input_word_r + input_word_l
+            embed_sememe_whole = embed_aggre_word_r_pure + embed_aggre_word_l_pure
+
+            w_c_i = torch.reshape(self.weight[pos], (2 * dim, dim))
+            output = torch.tanh(torch.matmul(torch.cat((embed_word_whole, embed_sememe_whole), 1), w_c_i) + self.bias)
+            return output
+
+    model = SEMSCMSAR(dim)
 
     # criterion = torch.nn.CrossEntropyLoss(weight=k, reduction='mean')
-    optimizer = torch.optim.SGD([W_a, b_a, w_k_init_eye, w_k_init_gaussian, b_c], lr=learning_rate)
-
-    state = {'optimizer':optimizer.state_dict()}   # 保存优化器的相关参数
+    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=lr_decay_rate)   # 学习率衰减
     # saver = tf.train.Saver(max_to_keep=3)  # saver for saving model
 
     # 这四个参数用来判断是否终止训练
@@ -100,18 +135,9 @@ if __name__ == '__main__':
             embed_sememe_l = utils_pt.norm(sememe_embedding[batch_dict['sl']])
             embed_sememe_r = utils_pt.norm(sememe_embedding[batch_dict['sr']])
             labels = torch.from_numpy(batch_dict['lb'])
-            W_c = w_k_init_eye + w_k_init_gaussian
-            W_c_i = torch.reshape(W_c[batch_dict['pos']], (2 * dim, dim))
+            pos = batch_dict['pos']
 
-            embed_sememe_l = F.softmax(torch.matmul(embed_sememe_l, torch.tanh(torch.matmul(embed_word_r, W_a) + b_a).t()), dim=0) * embed_sememe_l
-            embed_aggre_word_l_pure = torch.sum(embed_sememe_l, dim=0, keepdim=True)
-            embed_sememe_r = F.softmax(torch.matmul(embed_sememe_r, torch.tanh(torch.matmul(embed_word_l, W_a) + b_a).t()), dim=0) * embed_sememe_r
-            embed_aggre_word_r_pure = torch.sum(embed_sememe_r, dim=0, keepdim=True)
-
-            embed_word_whole = embed_word_r + embed_word_l
-            embed_sememe_whole = embed_aggre_word_r_pure + embed_aggre_word_l_pure
-
-            phrase_vec = torch.tanh(torch.matmul(torch.cat((embed_word_whole, embed_sememe_whole), 1), W_c_i) + b_c)
+            phrase_vec = model(pos, dim, embed_word_l, embed_word_r, embed_sememe_l, embed_sememe_r)
             y_hat = torch.matmul(phrase_vec, sememe_embedding.t())
             loss = CrossEntropyLoss(y_hat, labels, k)
 
@@ -121,14 +147,17 @@ if __name__ == '__main__':
             maps_train.append(map_score)
             loss_train += loss
 
-            loss.backward()
-            optimizer.step()
-
             if current_num % 100 == 0:
                 sys.stdout.flush()
                 sys.stdout.write('\rTraining num: ' + str(current_num) + ' of ' + str(train_num) + '.Epoch:' + str(epoch + 1))
                 loss_train = 0
-        torch.save(state, logdir_name + '/model_file/model_ckpt-' + str(epoch + 1))
+
+            loss.backward()
+            clip_gradient(optimizer, 5.0)
+            optimizer.step()
+
+        scheduler.step()
+        torch.save(model, logdir_name + '/model_file/model_ckpt-' + str(epoch + 1))
         # saver.save(sess, logdir_name + '/model_file/model_ckpt', global_step=epoch + 1)
 
         # dev set test
@@ -143,18 +172,9 @@ if __name__ == '__main__':
             embed_sememe_l = utils_pt.norm(sememe_embedding[batch_dev['sl']])
             embed_sememe_r = utils_pt.norm(sememe_embedding[batch_dev['sr']])
             labels = torch.from_numpy(batch_dev['lb'])
-            W_c = w_k_init_eye + w_k_init_gaussian
-            W_c_i = torch.reshape(W_c[batch_dev['pos']], (2 * dim, dim))
+            pos = batch_dev['pos']
 
-            embed_sememe_l = F.softmax(torch.matmul(embed_sememe_l, torch.tanh(torch.matmul(embed_word_r, W_a) + b_a).t()), dim=0) * embed_sememe_l
-            embed_aggre_word_l_pure = torch.sum(embed_sememe_l, dim=0, keepdim=True)
-            embed_sememe_r = F.softmax(torch.matmul(embed_sememe_r, torch.tanh(torch.matmul(embed_word_l, W_a) + b_a).t()), dim=0) * embed_sememe_r
-            embed_aggre_word_r_pure = torch.sum(embed_sememe_r, dim=0, keepdim=True)
-
-            embed_word_whole = embed_word_r + embed_word_l
-            embed_sememe_whole = embed_aggre_word_r_pure + embed_aggre_word_l_pure
-
-            phrase_vec = torch.tanh(torch.matmul(torch.cat((embed_word_whole, embed_sememe_whole), 1), W_c_i) + b_c)
+            phrase_vec = model(pos, dim, embed_word_l, embed_word_r, embed_sememe_l, embed_sememe_r)
             y_hat = torch.matmul(phrase_vec, sememe_embedding.t())
             loss = CrossEntropyLoss(y_hat, labels, k)
 
@@ -219,8 +239,7 @@ if __name__ == '__main__':
             phrase_vec_file = os.path.join(logdir_name, 'example_files', 'phrase_vector.txt')
             third_last = os.path.join(model_file, third_last)
 
-            checkpoint = torch.load(third_last)
-            optimizer.load_state_dict(checkpoint['optimizer'])
+            model = torch.load(third_last)
             # saver.restore(sess, third_last)
 
             # train set test
@@ -235,18 +254,9 @@ if __name__ == '__main__':
                 embed_sememe_l = utils_pt.norm(sememe_embedding[batch_train['sl']])
                 embed_sememe_r = utils_pt.norm(sememe_embedding[batch_train['sr']])
                 labels = torch.from_numpy(batch_train['lb'])
-                W_c = w_k_init_eye + w_k_init_gaussian
-                W_c_i = torch.reshape(W_c[batch_train['pos']], (2 * dim, dim))
+                pos = batch_train['pos']
 
-                embed_sememe_l = F.softmax(torch.matmul(embed_sememe_l, torch.tanh(torch.matmul(embed_word_r, W_a) + b_a).t()), dim=0) * embed_sememe_l
-                embed_aggre_word_l_pure = torch.sum(embed_sememe_l, dim=0, keepdim=True)
-                embed_sememe_r = F.softmax(torch.matmul(embed_sememe_r, torch.tanh(torch.matmul(embed_word_l, W_a) + b_a).t()), dim=0) * embed_sememe_r
-                embed_aggre_word_r_pure = torch.sum(embed_sememe_r, dim=0, keepdim=True)
-
-                embed_word_whole = embed_word_r + embed_word_l
-                embed_sememe_whole = embed_aggre_word_r_pure + embed_aggre_word_l_pure
-
-                phrase_vec = torch.tanh(torch.matmul(torch.cat((embed_word_whole, embed_sememe_whole), 1), W_c_i) + b_c)
+                phrase_vec = model(pos, dim, embed_word_l, embed_word_r, embed_sememe_l, embed_sememe_r)
                 y_hat = torch.matmul(phrase_vec, sememe_embedding.t())
                 loss = CrossEntropyLoss(y_hat, labels, k)
 
@@ -284,18 +294,9 @@ if __name__ == '__main__':
                 embed_sememe_l = utils_pt.norm(sememe_embedding[batch_test['sl']])
                 embed_sememe_r = utils_pt.norm(sememe_embedding[batch_test['sr']])
                 labels = torch.from_numpy(batch_test['lb'])
-                W_c = w_k_init_eye + w_k_init_gaussian
-                W_c_i = torch.reshape(W_c[batch_test['pos']], (2 * dim, dim))
+                pos = batch_test['pos']
 
-                embed_sememe_l = F.softmax(torch.matmul(embed_sememe_l, torch.tanh(torch.matmul(embed_word_r, W_a) + b_a).t()), dim=0) * embed_sememe_l
-                embed_aggre_word_l_pure = torch.sum(embed_sememe_l, dim=0, keepdim=True)
-                embed_sememe_r = F.softmax(torch.matmul(embed_sememe_r, torch.tanh(torch.matmul(embed_word_l, W_a) + b_a).t()), dim=0) * embed_sememe_r
-                embed_aggre_word_r_pure = torch.sum(embed_sememe_r, dim=0, keepdim=True)
-
-                embed_word_whole = embed_word_r + embed_word_l
-                embed_sememe_whole = embed_aggre_word_r_pure + embed_aggre_word_l_pure
-
-                phrase_vec = torch.tanh(torch.matmul(torch.cat((embed_word_whole, embed_sememe_whole), 1), W_c_i) + b_c)
+                phrase_vec = model(pos, dim, embed_word_l, embed_word_r, embed_sememe_l, embed_sememe_r)
                 y_hat = torch.matmul(phrase_vec, sememe_embedding.t())
                 loss = CrossEntropyLoss(y_hat, labels, k)
 
@@ -333,4 +334,3 @@ if __name__ == '__main__':
                     fp.write('MAP(test) classfied:{}:{}'.format(cls_dict[clss], sum(maps) / float(len(maps))))
                 fp.write("************TEST END***************\n")
             break
-
