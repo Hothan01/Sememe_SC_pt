@@ -5,10 +5,24 @@ import random
 import os
 import utils_pt
 
+
 # 计算多标签的loss，公式采用了tf.nn.weighted_cross_entropy_with_logits的计算公式
 def CrossEntropyLoss(inputs, targets, weight):
     res = (-1) * targets * torch.log(torch.sigmoid(inputs)) * weight + (1 - targets) * torch.log(1 - torch.sigmoid(inputs))
     return torch.mean(res)
+
+
+def clip_gradient(optimizer, grad_clip):   # 对应源码中优化器中的tf.clip_by_value()
+    """
+    Clips gradients computed during backpropagation to avoid explosion of gradients.
+
+    :param optimizer: optimizer with the gradients to be clipped
+    :param grad_clip: clip value
+    """
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            if param.grad is not None:
+                param.grad.data.clamp_(-grad_clip, grad_clip)
 
 
 if __name__ == '__main__':
@@ -59,13 +73,22 @@ if __name__ == '__main__':
     print(word_embedding.dtype)
     print(sememe_embedding.dtype)
 
-    W_c = torch.normal(0, 1.0, (2 * dim, dim), requires_grad=True).float()
-    b_c = torch.zeros(1, dim, requires_grad=True).float()
+    class SEMSCSA(torch.nn.Module):
+        def __init__(self, dim):
+            super(SEMSCSA, self).__init__()
+            self.linear1 = torch.nn.Linear(2 * dim, dim)
+            self.linear1.weight.data = torch.normal(0, 1.0, size=self.linear1.weight.data.size())   # W_c
+            self.linear1.bias.data = torch.zeros(size=self.linear1.bias.data.size())   # b_c
+
+        def forward(self, input):
+            output = torch.tanh(self.linear1(input))
+            return output
+
+    model = SEMSCSA(dim)
 
     # criterion = torch.nn.CrossEntropyLoss(weight=torch.tensor(k).float(), reduction='mean')
-    optimizer = torch.optim.SGD([W_c, b_c], lr=learning_rate)
-
-    state = {'optimizer':optimizer.state_dict()}   # 保存优化器的相关参数
+    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=lr_decay_rate)   # 学习率衰减
     # saver = tf.train.Saver(max_to_keep=3)  # saver for saving model
 
     # 这四个参数用来判断是否终止训练
@@ -98,29 +121,29 @@ if __name__ == '__main__':
             embed_word_whole = embed_word_r + embed_word_l
             embed_sememe_whole = embed_aggre_sememe_r_pure + embed_aggre_sememe_l_pure
 
-            phrase_vec = torch.tanh(torch.matmul(torch.cat((embed_word_whole, embed_sememe_whole), 1), W_c) + b_c)
+            phrase_vec = model(torch.cat((embed_word_whole, embed_sememe_whole), 1))
             y_hat = torch.matmul(phrase_vec, sememe_embedding.t())
             loss = CrossEntropyLoss(y_hat, labels, k)
 
             rank = torch.topk(torch.sigmoid(y_hat), k=hownet.sem_num, largest=True, sorted=True)
-
             map_score = utils_pt.cal_map_one(batch_dict['al'], rank[1])
             maps_train.append(map_score)
 
             loss_train += loss
 
-            loss.backward()
-            optimizer.step()
-
             if current_num % 100 == 0:
                 sys.stdout.flush()
                 sys.stdout.write('\rTraining num: ' + str(current_num) + ' of ' + str(train_num) + '.Epoch:' + str(epoch + 1))
                 loss_train = 0
-        torch.save(state, logdir_name + '/model_file/model_ckpt-' + str(epoch + 1) )
+
+            loss.backward()
+            clip_gradient(optimizer, 5.0)
+            optimizer.step()
+
+        scheduler.step()
+        torch.save(model, logdir_name + '/model_file/model_ckpt-' + str(epoch + 1))
         # saver.save(sess, logdir_name + '/model_file/model_ckpt', global_step=epoch + 1)
-        '''
-        目前到这一步，该处理下面的saver，需要将pytorch的这方面好好学一下
-        '''
+
         # dev set test
         maps_dev = []
         loss_dev = 0
@@ -138,7 +161,7 @@ if __name__ == '__main__':
             embed_word_whole = embed_word_r + embed_word_l
             embed_sememe_whole = embed_aggre_sememe_r_pure + embed_aggre_sememe_l_pure
 
-            phrase_vec = torch.tanh(torch.matmul(torch.cat((embed_word_whole, embed_sememe_whole), 1), W_c) + b_c)
+            phrase_vec = model(torch.cat((embed_word_whole, embed_sememe_whole), 1))
             y_hat = torch.matmul(phrase_vec, sememe_embedding.t())
             loss = CrossEntropyLoss(y_hat, labels, k)
 
@@ -198,8 +221,7 @@ if __name__ == '__main__':
             phrase_vec_file = os.path.join(logdir_name, 'example_files', 'phrase_vector.txt')
             third_last = os.path.join(model_file, third_last)
 
-            checkpoint = torch.load(third_last)
-            optimizer.load_state_dict(checkpoint['optimizer'])
+            model = torch.load(third_last)
             # saver.restore(sess, third_last)
 
             # train set test
@@ -219,7 +241,7 @@ if __name__ == '__main__':
                 embed_word_whole = embed_word_r + embed_word_l
                 embed_sememe_whole = embed_aggre_sememe_r_pure + embed_aggre_sememe_l_pure
 
-                phrase_vec = torch.tanh(torch.matmul(torch.cat((embed_word_whole, embed_sememe_whole), 1), W_c) + b_c)
+                phrase_vec = model(torch.cat((embed_word_whole, embed_sememe_whole), 1))
                 y_hat = torch.matmul(phrase_vec, sememe_embedding.t())
                 loss = CrossEntropyLoss(y_hat, labels, k)
 
@@ -258,7 +280,7 @@ if __name__ == '__main__':
                 embed_word_whole = embed_word_r + embed_word_l
                 embed_sememe_whole = embed_aggre_sememe_r_pure + embed_aggre_sememe_l_pure
 
-                phrase_vec = torch.tanh(torch.matmul(torch.cat((embed_word_whole, embed_sememe_whole), 1), W_c) + b_c)
+                phrase_vec = model(torch.cat((embed_word_whole, embed_sememe_whole), 1))
                 y_hat = torch.matmul(phrase_vec, sememe_embedding.t())
                 loss = CrossEntropyLoss(y_hat, labels, k)
 
@@ -291,5 +313,3 @@ if __name__ == '__main__':
                 fp.write('\nMAP(test) in epoch %d : %f'%(epoch+1,sum(maps_test)/float(len(hownet.comp_test))))
                 fp.write("************TEST END***************\n")
             break
-
-
