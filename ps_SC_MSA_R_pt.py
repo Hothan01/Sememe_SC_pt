@@ -7,6 +7,19 @@ import os
 import utils_pt
 
 
+def clip_gradient(optimizer, grad_clip):   # 对应源码中优化器中的tf.clip_by_value()
+    """
+    Clips gradients computed during backpropagation to avoid explosion of gradients.
+
+    :param optimizer: optimizer with the gradients to be clipped
+    :param grad_clip: clip value
+    """
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            if param.grad is not None:
+                param.grad.data.clamp_(-grad_clip, grad_clip)
+
+
 if __name__ == '__main__':
 
     # ################ Prepare Data ###################
@@ -15,13 +28,9 @@ if __name__ == '__main__':
     lr_decay_rate = 0.99                        # learning rate decay rate
     batch_size = 1                              # batch size, set to 1 because we use SGD
     learning_rate = 0.01                        # initial learning rate
-    # learning_rate = float(sys.argv[1])          # initial learning rate
     labda = 0.0001                              # regularization term labmda
-    # labda = float(sys.argv[2])                  # regularization term labmda
     total_epoch = 50                            # total training epoches
-    # total_epoch = int(sys.argv[3])              # total training epoches
     trunc_num = 5                               # dimention for decomposed sparse matrix
-    # trunc_num = int(sys.argv[4])
     hownet_filename = 'dataset/hownet.txt'
     comp_filename = 'dataset/all.bin'
     train_filename = 'dataset/train.bin'
@@ -60,24 +69,42 @@ if __name__ == '__main__':
     print(word_embedding.dtype)
     print(sememe_embedding.dtype)
 
-    W_a = torch.normal(0, 0.5, (dim, dim), requires_grad=True).float()
-    b_a = torch.zeros(1, dim, requires_grad=True).float()
-    U = torch.normal(0, 0.5, (4, 2 * dim, trunc_num), requires_grad=True).float()
-    V = torch.normal(0, 0.5, (4, dim, trunc_num), requires_grad=True).float()
-    W_c_base = torch.normal(0, 1, (2 * dim, dim), requires_grad=True).float()
-    b_c = torch.zeros(1, dim, requires_grad=True).float()
+    class SCMSAR(torch.nn.Module):
+        def __init__(self, dim, trunc_num):
+            super(SCMSAR, self).__init__()
+            self.linear1 = torch.nn.Linear(dim, dim)   # W_a, b_a
+            # 参数初始化
+            self.linear1.weight.data = torch.normal(0, 0.5, size=self.linear1.weight.data.size())
+            self.linear1.bias.data = torch.zeros(size=self.linear1.bias.data.size())
+            # 自定义内部需要更新的参数
+            u = torch.normal(0, 0.5, (4, 2 * dim, trunc_num), requires_grad=True)   # torch初始化时，默认dtype:float32
+            v = torch.normal(0, 0.5, (4, dim, trunc_num), requires_grad=True)
+            w_c_base = torch.normal(0, 1, (2 * dim, dim), requires_grad=True)
+            b_c = torch.zeros(1, dim, requires_grad=True)
+            self.weight_U = torch.nn.Parameter(u)
+            self.weight_V = torch.nn.Parameter(v)
+            self.weight_W = torch.nn.Parameter(w_c_base)
+            self.bias = torch.nn.Parameter(b_c)
 
-    # regularizer
-    '''
-    正则化暂时不考虑
-    tf.add_to_collection('losses', tf.contrib.layers.l2_regularizer(labda)(W_a))
-    tf.add_to_collection('losses', tf.contrib.layers.l2_regularizer(labda)(U))
-    tf.add_to_collection('losses', tf.contrib.layers.l2_regularizer(labda)(V))
-    tf.add_to_collection('losses', tf.contrib.layers.l2_regularizer(labda)(W_c_base))
-    '''
+        def forward(self, pos, dim, trunc_num, input_word_l, input_word_r, input_sememe_l, input_sememe_r):
+            u_i = torch.reshape(self.weight_U[pos], (2 * dim, trunc_num))
+            v_i = torch.reshape(self.weight_V[pos], (dim, trunc_num))
+            w_c_i = torch.matmul(u_i, v_i.t())
+            # attention
+            embed_sememe_l = F.softmax(torch.matmul(input_sememe_l, torch.tanh(self.linear1(input_word_r)).t()), dim=0) * input_sememe_l
+            embed_aggre_word_l_pure = torch.sum(embed_sememe_l, dim=0, keepdim=True)
+            embed_sememe_r = F.softmax(torch.matmul(input_sememe_r, torch.tanh(self.linear1(input_word_l)).t()), dim=0) * input_sememe_r
+            embed_aggre_word_r_pure = torch.sum(embed_sememe_r, dim=0, keepdim=True)
+            embed_word_whole = input_word_r + input_word_l
+            embed_sememe_whole = embed_aggre_word_r_pure + embed_aggre_word_l_pure
+            output = torch.tanh(torch.matmul(torch.cat((embed_word_whole, embed_sememe_whole), 1), w_c_i + self.weight_W) + self.bias)
+            return output
+
+    model = SCMSAR(dim, trunc_num)
 
     criterion = torch.nn.MSELoss(reduction='mean')
-    optimizer = torch.optim.SGD([W_a, b_a, U, V, W_c_base, b_c], lr=learning_rate)
+    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=lr_decay_rate)   # 学习率衰减
 
     # training
     random.shuffle(hownet.comp_train)
@@ -95,21 +122,11 @@ if __name__ == '__main__':
             embed_truth = word_embedding[batch_dict['lb']].view(1, -1)
             embed_sememe_l = utils_pt.norm(sememe_embedding[batch_dict['sl']])
             embed_sememe_r = utils_pt.norm(sememe_embedding[batch_dict['sr']])
-            U_i = torch.reshape(U[batch_dict['pos']], (2 * dim, trunc_num))
-            V_i = torch.reshape(V[batch_dict['pos']], (dim, trunc_num))
-            W_c_i = torch.matmul(U_i, V_i.t())
+            pos = batch_dict['pos']
 
-            # attention
-            embed_sememe_l = F.softmax(torch.matmul(embed_sememe_l, torch.tanh(torch.matmul(embed_word_r, W_a) + b_a).t()), dim=0) * embed_sememe_l
-            embed_aggre_word_l_pure = torch.sum(embed_sememe_l, dim=0, keepdim=True)
-            embed_sememe_r = F.softmax(torch.matmul(embed_sememe_r, torch.tanh(torch.matmul(embed_word_l, W_a) + b_a).t()), dim=0) * embed_sememe_r
-            embed_aggre_word_r_pure = torch.sum(embed_sememe_r, dim=0, keepdim=True)
-
-            embed_word_whole = embed_word_r + embed_word_l
-            embed_sememe_whole = embed_aggre_word_r_pure + embed_aggre_word_l_pure
-
-            phrase_vec = torch.tanh(torch.matmul(torch.cat((embed_word_whole, embed_sememe_whole), 1), W_c_i + W_c_base) + b_c)
-            loss = criterion(phrase_vec, embed_truth)
+            phrase_vec = model(pos, dim, trunc_num, embed_word_l, embed_word_r, embed_sememe_l, embed_sememe_r)
+            L2_loss = labda * (torch.norm(model.weight_U, 2) + torch.norm(model.weight_V, 2) + torch.norm(model.linear1.weight, 2) + torch.norm(model.weight_W, 2))
+            loss = criterion(phrase_vec, embed_truth) + L2_loss
             loss_this_epoch += loss
 
             if current_num % 100 == 0:
@@ -117,7 +134,9 @@ if __name__ == '__main__':
                 sys.stdout.write('\rTraining num: ' + str(current_num) + ' of ' + str(train_num) + ' loss:' + str(loss_this_epoch / (0.1 + current_num)))
 
             loss.backward()
+            clip_gradient(optimizer, 5.0)
             optimizer.step()
+        scheduler.step()
 
         with open(print_writer_filename, 'a', encoding='utf-8') as fprint:
             fprint.write('epoch: '+str(epoch+1)+' loss:'+str(loss_this_epoch/(0.1+len(hownet.comp_train)))+'\n')
@@ -127,31 +146,17 @@ if __name__ == '__main__':
     for current_num, dev_tup in enumerate(hownet.comp_dev):
         batch_dict = utils_pt.generate_one_example(hownet, dev_tup)
 
-        optimizer.zero_grad()
-
         embed_word_l = word_embedding[batch_dict['wl']].view(1, -1)   # 截取行的数据
         embed_word_r = word_embedding[batch_dict['wr']].view(1, -1)
         embed_truth = word_embedding[batch_dict['lb']].view(1, -1)
         embed_sememe_l = utils_pt.norm(sememe_embedding[batch_dict['sl']])
         embed_sememe_r = utils_pt.norm(sememe_embedding[batch_dict['sr']])
-        U_i = torch.reshape(U[batch_dict['pos']], (2 * dim, trunc_num))
-        V_i = torch.reshape(V[batch_dict['pos']], (dim, trunc_num))
-        W_c_i = torch.matmul(U_i, V_i.t())
+        pos = batch_dict['pos']
 
-        embed_sememe_l = F.softmax(torch.matmul(embed_sememe_l, torch.tanh(torch.matmul(embed_word_r, W_a) + b_a).t()), dim=0) * embed_sememe_l
-        embed_aggre_word_l_pure = torch.sum(embed_sememe_l, dim=0, keepdim=True)
-        embed_sememe_r = F.softmax(torch.matmul(embed_sememe_r, torch.tanh(torch.matmul(embed_word_l, W_a) + b_a).t()), dim=0) * embed_sememe_r
-        embed_aggre_word_r_pure = torch.sum(embed_sememe_r, dim=0, keepdim=True)
-
-        embed_word_whole = embed_word_r + embed_word_l
-        embed_sememe_whole = embed_aggre_word_r_pure + embed_aggre_word_l_pure
-
-        phrase_vec = torch.tanh(torch.matmul(torch.cat((embed_word_whole, embed_sememe_whole), 1), W_c_i + W_c_base) + b_c)
-        loss = criterion(phrase_vec, embed_truth)
+        phrase_vec = model(pos, dim, trunc_num, embed_word_l, embed_word_r, embed_sememe_l, embed_sememe_r)
+        L2_loss = labda * (torch.norm(model.weight_U, 2) + torch.norm(model.weight_V, 2) + torch.norm(model.linear1.weight, 2) + torch.norm(model.weight_W, 2))
+        loss = criterion(phrase_vec, embed_truth) + L2_loss
         loss_dev += loss
-
-        loss.backward()
-        optimizer.step()
 
     sys.stdout.flush()
     sys.stdout.write('\nDev set loss:' + str(loss_dev / (0.1 + len(hownet.comp_dev))) + '\n')
@@ -170,19 +175,9 @@ if __name__ == '__main__':
             embed_truth = word_embedding[batch_test['lb']].view(1, -1)
             embed_sememe_l = utils_pt.norm(sememe_embedding[batch_test['sl']])
             embed_sememe_r = utils_pt.norm(sememe_embedding[batch_test['sr']])
-            U_i = torch.reshape(U[batch_test['pos']], (2 * dim, trunc_num))
-            V_i = torch.reshape(V[batch_test['pos']], (dim, trunc_num))
-            W_c_i = torch.matmul(U_i, V_i.t())
+            pos = batch_test['pos']
 
-            embed_sememe_l = F.softmax(torch.matmul(embed_sememe_l, torch.tanh(torch.matmul(embed_word_r, W_a) + b_a).t()), dim=0) * embed_sememe_l
-            embed_aggre_word_l_pure = torch.sum(embed_sememe_l, dim=0, keepdim=True)
-            embed_sememe_r = F.softmax(torch.matmul(embed_sememe_r, torch.tanh(torch.matmul(embed_word_l, W_a) + b_a).t()), dim=0) * embed_sememe_r
-            embed_aggre_word_r_pure = torch.sum(embed_sememe_r, dim=0, keepdim=True)
-
-            embed_word_whole = embed_word_r + embed_word_l
-            embed_sememe_whole = embed_aggre_word_r_pure + embed_aggre_word_l_pure
-
-            phrase_vector = torch.tanh(torch.matmul(torch.cat((embed_word_whole, embed_sememe_whole), 1), W_c_i + W_c_base) + b_c)
+            phrase_vector = model(pos, dim, trunc_num, embed_word_l, embed_word_r, embed_sememe_l, embed_sememe_r)
 
             with open(phrase_vec_file, 'a', encoding='utf-8') as f_phrase_embed:
                 f_phrase_embed.write(test_tup[4] + ' ')
@@ -194,4 +189,3 @@ if __name__ == '__main__':
     print('Have written {} words to phrase_vector.txt'.format(number))
     with open(print_writer_filename, 'a', encoding='utf-8') as fprint:
         fprint.write('Have written {} words to phrase_vector.txt'.format(number))
-
